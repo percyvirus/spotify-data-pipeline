@@ -1,0 +1,114 @@
+volumes:
+  spotify_postgres_data:
+    driver: local
+  kestra_postgres_data:
+    driver: local
+  kestra_data:
+    driver: local
+  kestra_tmp:
+    driver: local
+  
+services:
+  spotify_db:
+    image: postgres:18
+    container_name: spotify_db
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: root
+      POSTGRES_DB: spotify_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - spotify_postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d spotify_db -U root"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: spotify_pgadmin
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@admin.com
+      - PGADMIN_DEFAULT_PASSWORD=root
+    ports:
+      - "8085:80"
+    depends_on:
+      spotify_db:
+        condition: service_healthy
+  kestra_db:
+    image: postgres:18
+    container_name: spotify_kestra_db
+    volumes:
+      - kestra_postgres_data:/var/lib/postgresql
+    environment:
+      POSTGRES_DB: kestra
+      POSTGRES_USER: kestra
+      POSTGRES_PASSWORD: k3str4
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d kestra -U kestra"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+  kestra:
+    image: kestra/kestra:v1.1
+    container_name: spotify_kestra
+    user: "root"
+    command: server standalone
+    volumes:
+      - kestra_data:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+      - kestra_tmp:/tmp/kestra-wd
+      - ./scripts:/app/scripts:ro
+      - ./kestra/flows:/app/flows
+      - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
+    environment:
+      ENV_PROJECT_DIR: ${PWD}
+      ENV_KAGGLE_API_TOKEN: ${KAGGLE_API_TOKEN}
+      ENV_GCLOUD_DIR: ${HOME}/.config/gcloud
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://kestra_db:5432/kestra
+            driverClassName: org.postgresql.Driver
+            username: kestra
+            password: k3str4
+        micronaut:
+          io:
+            watch:
+              enabled: true
+              paths:
+                - /app/flows
+        kestra:
+          plugins:
+            configurations:
+              - type: io.kestra.plugin.scripts.runner.docker.Docker
+                values:
+                  volume-enabled: true
+          variables:
+            env-vars-prefix: ENV_
+          server:
+            basicAuth:
+              username: "admin@kestra.io" # it must be a valid email address
+              password: Admin1234!
+          repository:
+            type: postgres
+          queue:
+            type: postgres
+          storage:
+            type: local
+            local:
+              basePath: "/app/storage"
+          tasks:
+            tmpDir:
+              path: /tmp/kestra-wd/tmp
+          url: http://localhost:8080/
+      GCP_PROJECT_ID: ${GCP_PROJECT_ID:-spotify-data-pipeline-513809}
+      GCS_BUCKET_NAME: ${GCS_BUCKET_NAME:-spotify-datalake-spotify-data-pipeline-513809}
+      KAGGLE_API_TOKEN: ${KAGGLE_API_TOKEN}
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    depends_on:
+      kestra_db:
+        condition: service_healthy

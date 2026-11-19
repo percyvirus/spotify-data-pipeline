@@ -1,0 +1,26 @@
+id: 01_spotify_ingest
+namespace: company.team
+
+tasks:
+  # Step 1: Ingest from Kaggle to Data Lake (GCS)
+  - id: run_ingest_script
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      volumes:
+        - "{{ envs.project_dir }}/scripts:/app/scripts:ro"
+        - "{{ envs.gcloud_dir }}:/root/.config/gcloud:ro"
+    containerImage: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+    env:
+      GCP_PROJECT_ID: "{{ kv('GCP_PROJECT_ID') }}"
+      GCS_BUCKET_NAME: "{{ kv('GCS_BUCKET_NAME') }}"
+      KAGGLE_API_TOKEN: "{{ envs.kaggle_api_token | default('') }}"
+      POSTGRES_HOST: "{{ kv('POSTGRES_HOST') }}"
+      POSTGRES_PORT: "{{ kv('POSTGRES_PORT') }}"
+      POSTGRES_DB: "{{ kv('POSTGRES_DB') }}"
+      POSTGRES_USER: "{{ kv('POSTGRES_USER') }}"
+      POSTGRES_PASSWORD: "{{ kv('POSTGRES_PASSWORD') }}"
+    commands:
+      - uv pip install --system google-cloud-storage kaggle tqdm six
+      - ls -la /app/scripts
+      - python /app/scripts/ingest_to_gcs.py

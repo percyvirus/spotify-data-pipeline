@@ -1,0 +1,8 @@
+.env
+*.tfstate
+*.tfstate.backup
+.terraform/
+scripts/gcp-creds.json
+scripts/*.png
+__pycache__/
+.DS_Store

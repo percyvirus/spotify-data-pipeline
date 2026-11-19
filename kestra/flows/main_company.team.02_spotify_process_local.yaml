@@ -1,0 +1,43 @@
+id: 02_spotify_process_local
+namespace: company.team
+
+tasks:
+  - id: run_pyspark_local
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      volumes:
+        - "{{ envs.project_dir }}/scripts:/app/scripts:ro"
+        # Mount the local Mac path to /data inside the container
+        - "/Volumes/PERCYVIRUS/DATASETS/metadata_datasets/spotify-dev-dataset:/data:ro"
+    containerImage: python:3.12-bookworm
+    env:
+      LOCAL_DATA_PATH: "/data"
+      POSTGRES_HOST: "{{ kv('POSTGRES_HOST') }}"
+      POSTGRES_PORT: "{{ kv('POSTGRES_PORT') }}"
+      POSTGRES_DB: "{{ kv('POSTGRES_DB') }}"
+      POSTGRES_USER: "{{ kv('POSTGRES_USER') }}"
+      POSTGRES_PASSWORD: "{{ kv('POSTGRES_PASSWORD') }}"
+    commands:
+      - apt-get update && apt-get install -y default-jre
+      - pip install pyspark
+      - python /app/scripts/process_data_local.py
+
+  - id: apply_postgres_indexes
+    type: io.kestra.plugin.jdbc.postgresql.Queries
+    url: jdbc:postgresql://{{ kv('POSTGRES_HOST') }}:{{ kv('POSTGRES_PORT') }}/{{ kv('POSTGRES_DB') }}
+    username: "{{ kv('POSTGRES_USER') }}"
+    password: "{{ kv('POSTGRES_PASSWORD') }}"
+    sql: |
+      ALTER TABLE dim_artists ADD PRIMARY KEY (id);
+      ALTER TABLE dim_albums ADD PRIMARY KEY (id);
+      ALTER TABLE dim_tracks ADD PRIMARY KEY (id);
+      ALTER TABLE dim_playlists ADD PRIMARY KEY (id);
+      ALTER TABLE dim_markets ADD PRIMARY KEY (id);
+      ALTER TABLE fact_track_audio_features ADD PRIMARY KEY (id);
+      ALTER TABLE fact_track_files ADD PRIMARY KEY (id);
+      CREATE INDEX idx_dim_albums_market ON dim_albums(spotify_available_markets_id);
+      CREATE INDEX idx_dim_tracks_album ON dim_tracks(album_id);
+      CREATE INDEX idx_fact_audio_track ON fact_track_audio_features(track_id);
+      CREATE INDEX idx_bridge_track_artists_track ON bridge_track_artists(track_id);
+      CREATE INDEX idx_bridge_track_artists_artist ON bridge_track_artists(artist_id);

@@ -1,0 +1,19 @@
+[project]
+name = "spotify-data-pipeline"
+version = "0.1.0"
+description = "End-to-end Data Engineering pipeline for the Spotify Metadata Archive (Kestra, PySpark, BigQuery, Terraform)"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "db-dtypes>=1.2.0",
+    "google-cloud-bigquery>=3.25.0",
+    "google-cloud-storage>=2.18.0",
+    "kaggle>=1.6.17",
+    "matplotlib>=3.9.0",
+    "numpy>=1.26.4",
+    "pandas>=2.2.2",
+    "pyarrow>=17.0.0",
+    "pyspark==3.5.3",
+    "six>=1.16.0",
+    "tqdm>=4.66.5",
+]

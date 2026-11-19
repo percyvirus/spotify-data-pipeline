@@ -1,0 +1,51 @@
+id: 04_spotify_full_pipeline
+namespace: company.team
+description: End-to-end master pipeline orchestrating KV validation, Kaggle-to-GCS ingestion, PySpark Star Schema ETL, and BigQuery Analytical Marts.
+
+inputs:
+  - id: run_ingestion
+    type: BOOLEAN
+    defaults: false
+    description: Set to true to re-download the dataset from Kaggle to GCS (Stage 01).
+
+  - id: run_pyspark_etl
+    type: BOOLEAN
+    defaults: true
+    description: Set to true to run the full PySpark transformation from GCS to BigQuery Raw (Stage 02).
+
+tasks:
+  - id: ensure_kv_config
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: company.team
+    flowId: 00_gcp_kv_setup
+    wait: true
+    transmitFailed: true
+
+  - id: stage_01_ingest_to_gcs
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.run_ingestion }}"
+    then:
+      - id: trigger_ingest
+        type: io.kestra.plugin.core.flow.Subflow
+        namespace: company.team
+        flowId: 01_spotify_ingest
+        wait: true
+        transmitFailed: true
+
+  - id: stage_02_pyspark_gcs_to_bq
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ inputs.run_pyspark_etl }}"
+    then:
+      - id: trigger_pyspark
+        type: io.kestra.plugin.core.flow.Subflow
+        namespace: company.team
+        flowId: 02_spotify_process_gcs
+        wait: true
+        transmitFailed: true
+
+  - id: stage_03_build_bigquery_marts
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: company.team
+    flowId: 03_spotify_bigquery_marts
+    wait: true
+    transmitFailed: true

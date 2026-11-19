@@ -1,0 +1,402 @@
+id: 03_spotify_bigquery_marts
+namespace: company.team
+
+variables:
+  project_id: "{{ kv('GCP_PROJECT_ID') }}"
+  raw_dataset: "{{ kv('GCP_DATASET') }}"
+  mart_dataset: "spotify_data_marts"
+
+tasks:
+  - id: create_mart_dataset
+    type: io.kestra.plugin.gcp.bigquery.CreateDataset
+    projectId: "{{ render(vars.project_id) }}"
+    name: "{{ render(vars.mart_dataset) }}"
+    location: "EU"
+    ifExists: SKIP
+
+  - id: build_all_analytics_marts
+    type: io.kestra.plugin.core.flow.Parallel
+    concurrent: 4
+    tasks:
+      # 1. Songs by Popularity (Normal & Log Scale)
+      - id: mart_tracks_popularity
+        type: io.kestra.plugin.gcp.bigquery.Query
+        projectId: "{{ render(vars.project_id) }}"
+        sql: |
+          CREATE OR REPLACE TABLE `{{ render(vars.project_id) }}.{{ render(vars.mart_dataset) }}.mart_tracks_popularity` AS
+          SELECT
+            spotify_popularity AS popularity_score,
+            COUNT(*) AS song_count
+          FROM `{{ render(vars.project_id) }}.{{ render(vars.raw_dataset) }}.dim_tracks`
+          WHERE spotify_popularity IS NOT NULL
+          GROUP BY 1
+          ORDER BY 1;
+
+      # 2. Archived Tracks Coverage by Popularity Score (100% Real Metadata from track_files)
+      - id: mart_archive_coverage_by_pop
+        type: io.kestra.plugin.gcp.bigquery.Query
+        projectId: "{{ render(vars.project_id) }}"
+        sql: |
+          CREATE OR REPLACE TABLE `{{ render(vars.project_id) }}.{{ render(vars.mart_dataset) }}.mart_archive_coverage_by_pop` AS
+          SELECT
+            t.spotify_popularity AS popularity_score,
+            CASE
+              WHEN tf.spotify_status = 'success' THEN 'Archived'
+              WHEN tf.spotify_status = 'skipped_isrc_has_download' OR tf.spotify_isrc_has_download = TRUE THEN 'ISRC Copy Archived'
+              ELSE 'Not Archived'
+            END AS archive_status,
+            COUNT(*) AS track_count
+          FROM `{{ render(vars.project_id) }}.{{ render(vars.raw_dataset) }}.dim_tracks` t
+          LEFT JOIN `{{ render(vars.project_id) }}.{{ render(vars.raw_dataset) }}.fact_track_files` tf
+            ON t.id = tf.track_id
+          WHERE t.spotify_popularity IS NOT NULL
+          GROUP BY 1, 2
+          ORDER BY 1, 2;
+
+      # 4 & 5. Tracks by Duration (<10m in 5s bins) & Long Tracks (>=10m in 1m bins)
+      - id: mart_tracks_duration
+        type: io.kestra.plugin.gcp.bigquery.Query
+        projectId: "{{ render(vars.project_id) }}"
+        sql: |
+          CREATE OR REPLACE TABLE `{{ render(vars.project_id) }}.{{ render(vars.mart_dataset) }}.mart_tracks_duration` AS
+          SELECT
+            CASE
+              WHEN spotify_duration_ms < 600000 THEN 'Standard (<10 min)'
+              ELSE 'Long (>=10 min)'
+            END AS duration_category,
+            CASE
+              WHEN spotify_duration_ms < 600000 THEN CAST(FLOOR(spotify_duration_ms / 5000) * 5 AS INT64)
+              WHEN spotify_duration_ms >= 18000000 THEN 18000 -- Capped at >= 5:00:00 (18,000s)
+              ELSE CAST(FLOOR(spotify_duration_ms / 60000) * 60 AS INT64)
+            END AS duration_bucket_sec,
+            COUNT(*) AS song_count
+          FROM `{{ render(vars.project_id) }}.{{ render(vars.raw_dataset) }}.dim_tracks`
+          WHERE spotify_duration_ms IS NOT NULL AND spotify_duration_ms >= 0
+          GROUP BY 1, 2
+          ORDER BY 1, 2;
+
+      # 6. Songs by Content Rating (Explicit vs Clean)
+      - id: mart_tracks_content_rating
+        type: io.kestra.plugin.gcp.bigquery.Query
+        projectId: "{{ render(vars.project_id) }}"
+        sql: |
+          CREATE OR REPLACE TABLE `{{ render(vars.project_id) }}.{{ render(vars.mart_dataset) }}.mart_tracks_content_rating` AS
+          SELECT
+            CASE WHEN spotify_explicit = TRUE THEN 'Explicit' ELSE 'Clean' END AS content_type,
+            COUNT(*) AS song_count
+          FROM `{{ render(vars.project_id) }}.{{ render(vars.raw_dataset) }}.dim_tracks`
+          GROUP BY 1;
+
+      # 7. Duplicates per ISRC
+      - id: mart_isrc_duplicates
+        type: io.kestra.plugin.gcp.bigquery.Query
+        projectId: "{{ render(vars.project_id) }}"
+        sql: |
+          CREATE OR REPLACE TABLE `{{ render(vars.project_id) }}.{{ render(vars.mart_dataset) }}.mart_isrc_duplicates` AS
+          WITH isrc_counts AS (
+            SELECT
+              spotify_isrc,
+              COUNT(*) AS copies_count
+            FROM `{{ render(vars.project_id) }}.{{ render(vars.raw_dataset) }}.dim_tracks`
+            WHERE spotify_isrc IS NOT NULL AND spotify_isrc != ''
+            GROUP BY 1
+          )
+          SELECT
+            CASE WHEN copies_count >= 100 THEN 100 ELSE copies_count END AS track_copies_bucket,
+            COUNT(*) AS unique_isrc_count,
+            SUM(copies_count) AS total_tracks_in_bucket
+          FROM isrc_counts
+          GROUP BY 1
+          ORDER BY 1;
+
+      # 8. Top 20 vs Bottom 20 Markets by Song Availability (Pop >= 10)
+      - id: mart_markets_availability
+        type: io.kestra.plugin.gcp.bigquery.Query
+        projectId: "{{ render(vars.project_id) }}"
+        sql: |
+          CREATE OR REPLACE TABLE `{{ render(vars.project_id) }}.{{ render(vars.mart_dataset) }}.mart_markets_availability` AS
+          WITH market_track_groups AS (
+            SELECT
+              spotify_available_markets_id,
+              COUNT(*) AS popular_tracks_count
+            FROM `{{ render(vars.project_id) }}.{{ render(vars.raw_dataset) }}.dim_tracks`
+            WHERE spotify_popularity >= 10
+            GROUP BY 1
+          ),
+          exploded_markets AS (
+            SELECT
+              TRIM(market_code) AS market_code,
+              SUM(g.popular_tracks_count) AS available_songs_count
+            FROM market_track_groups g
+            JOIN `{{ render(vars.project_id) }}.{{ render(vars.raw_dataset) }}.dim_markets` m
+              ON g.spotify_available_markets_id = m.id
+            CROSS JOIN UNNEST(SPLIT(IFNULL(NULLIF(m.spotify_available_markets, ''), 'unavailable'), ',')) AS market_code
+            GROUP BY 1
+          ),
+          ranked_markets AS (
+            SELECT
+              market_code,
+              available_songs_count,
+              RANK() OVER (ORDER BY available_songs_count DESC) AS rank_top,
+              RANK() OVER (ORDER BY available_songs_count ASC) AS rank_bottom
+            FROM exploded_markets
+          )
+          SELECT
+            market_code,
+            available_songs_count,
+            CASE
+              WHEN rank_top <= 20 THEN 'Top 20 Markets'
+              WHEN rank_bottom <= 21 THEN 'Bottom 20 Markets'
+              ELSE 'Middle'
+            END AS market_tier,
+            rank_top
+          FROM ranked_markets
+          ORDER BY available_songs_count DESC;
+
+      # 9 & 10. Top 30 Genres & Genre Hierarchy (Artists > 500) - Audited against all 625 genres
+      - id: mart_genres_hierarchy
+        type: io.kestra.plugin.gcp.bigquery.Query
+        projectId: "{{ render(vars.project_id) }}"
+        sql: |
+          CREATE OR REPLACE TABLE `{{ render(vars.project_id) }}.{{ render(vars.mart_dataset) }}.mart_genres_hierarchy` AS
+          WITH genre_counts AS (
+            SELECT
+              LOWER(TRIM(spotify_genre)) AS genre,
+              COUNT(DISTINCT artist_id) AS artist_count
+            FROM `{{ render(vars.project_id) }}.{{ render(vars.raw_dataset) }}.bridge_artist_genres`
+            GROUP BY 1
+          )
+          SELECT
+            genre,
+            artist_count,
+            CASE
+              -- Compound & Specific Overrides First (to avoid substring collisions)
+              WHEN genre IN ('hardcore punk', 'post-hardcore', 'melodic hardcore', 'punk rap', 'britpop', 'indie pop', 'french indie pop', 'emo pop', 'pop rock', 'pop punk', 'folk rock', 'country rock', 'funk rock', 'rap rock', 'electronic rock', 'reggae rock', 'celtic rock', 'indie r&b', 'indie jazz', 'indie folk', 'lovers rock', 'rocksteady') THEN 'Rock'
+              WHEN genre IN ('hardcore hip hop', 'jazz rap', 'emo rap', 'country hip hop', 'anime rap', 'meme rap', 'pop rap', 'trap funk', 'arabic rap', 'malay rap', 'moroccan rap') THEN 'Hip Hop/Rap'
+              WHEN genre IN ('funk carioca', 'brazilian funk', 'brega funk', 'funk de bh', 'funk consciente', 'funk melody', 'electro corridos', 'latin pop', 'latin dance', 'latin r&b', 'latin rock', 'latin indie', 'latin alternative', 'latin folk', 'latin hip hop', 'latin jazz', 'spanish-language reggae') THEN 'Latin'
+              WHEN genre IN ('indie dance', 'indie electronic', 'electropop', 'synthpop', 'dance pop', 'electro swing', 'disco polo', 'post-disco') THEN 'Electronic/Dance'
+              WHEN genre IN ('chamber pop', 'baroque pop') THEN 'Pop'
+              WHEN genre IN ('folklore argentino', 'karadeniz folk', 'christian country', 'christian folk', 'acoustic folk') THEN 'Country/Folk'
+              WHEN genre IN ('gospel r&b', 'african gospel', 'southern gospel', 'pop worship') THEN 'Gospel/Christian'
+              WHEN genre IN ('liquid funk') THEN 'Electronic/Dance'
+
+              -- 1. Electronic/Dance (~520k)
+              WHEN REGEXP_CONTAINS(genre, r'house|techno|trance|edm|dubstep|drum and bass|dnb|breakbeat|electronic|electronica|ambient|synth|electro|riddim|hardstyle|hardcore|jungle|amapiano|downtempo|idm|uk garage|bass|step|wave|chillout|lounge|club|dance|beats|gabber|psy|goa|minimal|acid|glitch|industrial|ebm|darkwave|cold wave|lo-fi|tekno|future bass|russelåter|trip hop|frenchcore|vaporwave|hi-nrg|freestyle|big room|eurodance|moombahton|footwork|drumstep|private school piano|jersey club|melbourne bounce|chillstep|bounce|3 step|epadunk|big beat|afropiano|nightcore|new rave|budots|singeli|cedm|vinahouse|disco|funkot') THEN 'Electronic/Dance'
+
+              -- 2. Rock (~370k)
+              WHEN REGEXP_CONTAINS(genre, r'rock|metal|punk|grunge|indie|rockabilly|emo|shoegaze|screamo|core|djent|doom|sludge|stoner|thrash|death|black|prog|psychedelic|garage|new wave|goth|alt-z|surf|psychobilly|grindcore|deathcore|slowcore|visual kei|dark cabaret|neue deutsche welle|madchester|pinoy alternative|bisrock|indorock') THEN 'Rock'
+
+              -- 3. World/Traditional (~202k)
+              WHEN REGEXP_CONTAINS(genre, r'celtic|polka|vocaloid|raï|rai|gnawa|fado|klezmer|afrobeat|afropop|highlife|gamelan|traditional|ethnic|world|tribal|enka|kayokyoku|chanson|variété|variete|liedermacher|schlager|dangdut|malay|bhangra|gufeng|arabesk|iskelmä|iskelma|laïko|laiko|oyun havasi|luk thung|manele|dansband|khaleeji|entehno|sea shanties|shibuya-kei|gujarati garba|batak|lagu jawa|lagu timur|maluku|bongo flava|dansktop|azonto|phleng phuea chiwit|southern thai|moroccan chaabi|desi|kundiman|harana|hiplife|alté|alte|bacardi|gengetone') THEN 'World/Traditional'
+
+              -- 4. Latin (~189k)
+              WHEN REGEXP_CONTAINS(genre, r'latin|reggaeton|salsa|cumbia|bachata|tango|flamenco|samba|bossa|mpb|mariachi|banda|corrido|forró|forro|zouk|soca|bolero|vallenato|merengue|dembow|urbano|ranchera|norteño|norteno|sertanejo|pagode|axé|axe|choro|tropical|tejano|grupero|mambo|cha cha|rumba|trova|nueva cancion|brega|guaracha|piseiro|huayno|timba|chicha|rkt|seresta|arrocha|sierreño|sierreno|champeta|turreo|música mexicana|musica mexicana|cuarteto|neoperreo|duranguense|punta|punto guajiro|chamamé|chamame|agronejo|kompa|kizomba|kuduro') THEN 'Latin'
+
+              -- 5. Hip Hop/Rap (~166k)
+              WHEN REGEXP_CONTAINS(genre, r'hip hop|rap|trap|drill|grime|phonk|boom bap|g-funk|crunk|hyphy|cloud|turntablism|freestyle|beatbox|urban|horrorcore|nerdcore|asakaa') THEN 'Hip Hop/Rap'
+
+              -- 6. Pop (~151k)
+              WHEN REGEXP_CONTAINS(genre, r'pop|hyperpop|boy band|girl group|idol|eurovision|cantopop|mandopop|j-pop|k-pop|c-pop|v-pop|t-pop|p-pop|opm|easy listening|adult standards|soft|ballad|k-ballad|neomelodico|canzone napoletana') THEN 'Pop'
+
+              -- 7. Classical (~106k)
+              WHEN REGEXP_CONTAINS(genre, r'classical|opera|choral|chamber|baroque|symphony|orchestra|orchestral|renaissance|medieval|early music|contemporary classical|neoclassical|minimalism|concerto|sonata|quartet|violin|piano|cello|harp|choir|requiem|soundtrack|score|cinematic|film|video game|musical|broadway|show tunes|gregorian chant') THEN 'Classical'
+
+              -- 8. Jazz (~72k)
+              WHEN REGEXP_CONTAINS(genre, r'jazz|swing|bebop|big band|ragtime|fusion|smooth jazz|dixieland|gypsy jazz|nu jazz|acid jazz|hard bop|exotica|afroswing') THEN 'Jazz'
+
+              -- 9. Regional/National (~63k)
+              WHEN REGEXP_CONTAINS(genre, r'tollywood|mollywood|sandalwood|kollywood|bollywood|mizrahi|african|arabic|turkish|indian|punjabi|tamil|telugu|hindi|bengali|bhojpuri|russian|polish|french|german|italian|swedish|norwegian|finnish|danish|dutch|greek|thai|vietnamese|indonesian|korean|japanese|chinese|irish|scottish|nordic|balkan|romani|persian|armenian|georgian|ukrainian|czech|hungarian|romanian|portuguese') THEN 'Regional/National'
+
+              -- 10. Gospel/Christian (~62k)
+              WHEN REGEXP_CONTAINS(genre, r'gospel|christian|worship|ccm|praise|hymn|bhajan|devotional|qawwali|sufi|islamic|nasheed|jewish|cantorial|liturgical|mantra|kirtan|spiritual|pentecostal|sholawat|evangelical') THEN 'Gospel/Christian'
+
+              -- 11. Country/Folk (~58k)
+              WHEN REGEXP_CONTAINS(genre, r'folk|country|bluegrass|americana|singer-songwriter|acoustic|outlaw|honky tonk|western|roots|appalachian|red dirt|newgrass') THEN 'Country/Folk'
+
+              -- 12. Funk/Disco (~52k)
+              WHEN REGEXP_CONTAINS(genre, r'funk|disco|boogie|nu-disco|p-funk|motown|go-go') THEN 'Funk/Disco'
+
+              -- 13. Reggae/Dancehall (~37k)
+              WHEN REGEXP_CONTAINS(genre, r'reggae|dancehall|ska|dub|ragga|calypso|mento|shatta') THEN 'Reggae/Dancehall'
+
+              -- 14. Comedy/Novelty (~30k)
+              WHEN REGEXP_CONTAINS(genre, r'comedy|novelty|parody|spoken word|audiobook|children|kids|lullaby|nursery|cartoon|anime|asmr|white noise|sleep|meditation|relaxation|nature|workout|fitness|holiday|christmas|new age|space music') THEN 'Comedy/Novelty'
+
+              -- 15. Experimental/Avant-Garde (~28k)
+              WHEN REGEXP_CONTAINS(genre, r'experimental|avant-garde|noise|drone|musique concrete|abstract|sound art|electroacoustic|free improvisation') THEN 'Experimental/Avant-Garde'
+
+              -- 16. R&B/Soul (~27k)
+              WHEN REGEXP_CONTAINS(genre, r'r&b|soul|neo soul|quiet storm|new jack swing|doo-wop|northern soul|uk funky') THEN 'R&B/Soul'
+
+              -- 17. Blues (~17k)
+              WHEN REGEXP_CONTAINS(genre, r'blues|boogie-woogie|delta|zydeco|cajun') THEN 'Blues'
+
+              -- 18. Other (~39k residual)
+              ELSE 'Other'
+            END AS macro_genre,
+            RANK() OVER (ORDER BY artist_count DESC) AS genre_rank
+          FROM genre_counts
+          WHERE artist_count > 500
+          ORDER BY artist_count DESC;
+
+      # 11. Artists by Popularity Score (Log Scale)
+      - id: mart_artists_popularity
+        type: io.kestra.plugin.gcp.bigquery.Query
+        projectId: "{{ render(vars.project_id) }}"
+        sql: |
+          CREATE OR REPLACE TABLE `{{ render(vars.project_id) }}.{{ render(vars.mart_dataset) }}.mart_artists_popularity` AS
+          SELECT
+            spotify_popularity AS popularity_score,
+            COUNT(*) AS artist_count
+          FROM `{{ render(vars.project_id) }}.{{ render(vars.raw_dataset) }}.dim_artists`
+          WHERE spotify_popularity IS NOT NULL
+          GROUP BY 1
+          ORDER BY 1;
+
+      # 12. Album Releases by Year (<1970 to 2025)
+      - id: mart_albums_by_year
+        type: io.kestra.plugin.gcp.bigquery.Query
+        projectId: "{{ render(vars.project_id) }}"
+        sql: |
+          CREATE OR REPLACE TABLE `{{ render(vars.project_id) }}.{{ render(vars.mart_dataset) }}.mart_albums_by_year` AS
+          WITH parsed_years AS (
+            SELECT
+              SAFE_CAST(SUBSTR(spotify_release_date, 1, 4) AS INT64) AS release_year
+            FROM `{{ render(vars.project_id) }}.{{ render(vars.raw_dataset) }}.dim_albums`
+            WHERE spotify_release_date IS NOT NULL AND LENGTH(spotify_release_date) >= 4
+          )
+          SELECT
+            CASE
+              WHEN release_year < 1970 THEN '<1970'
+              ELSE CAST(release_year AS STRING)
+            END AS release_year_label,
+            CASE
+              WHEN release_year < 1970 THEN 1969
+              ELSE release_year
+            END AS sort_year,
+            COUNT(*) AS album_count
+          FROM parsed_years
+          WHERE release_year BETWEEN 1800 AND 2026
+          GROUP BY 1, 2
+          ORDER BY 2;
+
+      # 13. Albums by Track Count (1 to 50+)
+      - id: mart_albums_track_count
+        type: io.kestra.plugin.gcp.bigquery.Query
+        projectId: "{{ render(vars.project_id) }}"
+        sql: |
+          CREATE OR REPLACE TABLE `{{ render(vars.project_id) }}.{{ render(vars.mart_dataset) }}.mart_albums_track_count` AS
+          SELECT
+            CASE
+              WHEN spotify_total_tracks >= 50 THEN '50+'
+              ELSE CAST(spotify_total_tracks AS STRING)
+            END AS track_count_label,
+            CASE
+              WHEN spotify_total_tracks >= 50 THEN 50
+              ELSE spotify_total_tracks
+            END AS sort_tracks,
+            COUNT(*) AS album_count
+          FROM `{{ render(vars.project_id) }}.{{ render(vars.raw_dataset) }}.dim_albums`
+          WHERE spotify_total_tracks IS NOT NULL AND spotify_total_tracks >= 1
+          GROUP BY 1, 2
+          ORDER BY 2;
+
+      # 14. Duplicate Albums per UPC (Log Scale)
+      - id: mart_upc_duplicates
+        type: io.kestra.plugin.gcp.bigquery.Query
+        projectId: "{{ render(vars.project_id) }}"
+        sql: |
+          CREATE OR REPLACE TABLE `{{ render(vars.project_id) }}.{{ render(vars.mart_dataset) }}.mart_upc_duplicates` AS
+          WITH upc_counts AS (
+            SELECT
+              spotify_upc,
+              COUNT(*) AS album_copies
+            FROM `{{ render(vars.project_id) }}.{{ render(vars.raw_dataset) }}.dim_albums`
+            WHERE spotify_upc IS NOT NULL AND spotify_upc != ''
+            GROUP BY 1
+          )
+          SELECT
+            album_copies,
+            COUNT(*) AS unique_upc_count
+          FROM upc_counts
+          GROUP BY 1
+          ORDER BY 1;
+
+      # 15. Mode Distribution by Musical Key
+      - id: mart_key_mode_distribution
+        type: io.kestra.plugin.gcp.bigquery.Query
+        projectId: "{{ render(vars.project_id) }}"
+        sql: |
+          CREATE OR REPLACE TABLE `{{ render(vars.project_id) }}.{{ render(vars.mart_dataset) }}.mart_key_mode_distribution` AS
+          WITH key_mode_counts AS (
+            SELECT
+              spotify_key,
+              CASE spotify_key
+                WHEN 0 THEN 'C'
+                WHEN 1 THEN 'C#/Db'
+                WHEN 2 THEN 'D'
+                WHEN 3 THEN 'D#/Eb'
+                WHEN 4 THEN 'E'
+                WHEN 5 THEN 'F'
+                WHEN 6 THEN 'F#/Gb'
+                WHEN 7 THEN 'G'
+                WHEN 8 THEN 'G#/Ab'
+                WHEN 9 THEN 'A'
+                WHEN 10 THEN 'A#/Bb'
+                WHEN 11 THEN 'B'
+              END AS musical_key,
+              CASE spotify_mode
+                WHEN 1 THEN 'Major'
+                WHEN 0 THEN 'Minor'
+              END AS modality,
+              COUNT(*) AS song_count
+            FROM `{{ render(vars.project_id) }}.{{ render(vars.raw_dataset) }}.fact_track_audio_features`
+            WHERE spotify_key BETWEEN 0 AND 11 AND spotify_mode IN (0, 1)
+            GROUP BY 1, 2, 3
+          )
+          SELECT
+            spotify_key,
+            musical_key,
+            modality,
+            song_count,
+            ROUND(song_count * 100.0 / SUM(song_count) OVER (), 2) AS percentage_of_songs
+          FROM key_mode_counts
+          ORDER BY spotify_key, modality;
+
+      # 16. Audio Features Sample (250k tracks for Correlation Heatmaps & Histograms)
+      - id: mart_audio_features_sample
+        type: io.kestra.plugin.gcp.bigquery.Query
+        projectId: "{{ render(vars.project_id) }}"
+        sql: |
+          CREATE OR REPLACE TABLE `{{ render(vars.project_id) }}.{{ render(vars.mart_dataset) }}.mart_audio_features_sample` AS
+          SELECT
+            spotify_tempo AS tempo,
+            spotify_energy AS energy,
+            spotify_valence AS valence,
+            spotify_danceability AS danceability,
+            spotify_acousticness AS acousticness,
+            spotify_loudness AS loudness,
+            spotify_liveness AS liveness,
+            spotify_instrumentalness AS instrumentalness,
+            spotify_speechiness AS speechiness
+          FROM `{{ render(vars.project_id) }}.{{ render(vars.raw_dataset) }}.fact_track_audio_features`
+          WHERE spotify_null_response = FALSE
+            AND spotify_tempo IS NOT NULL
+            AND RAND() < 0.0015
+          LIMIT 250000;
+  - id: generate_audio_correlation_heatmap
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      volumes:
+        - "{{ envs.project_dir }}/scripts:/app/scripts"
+        - "{{ envs.project_dir }}/assets:/app/assets"
+        - "{{ envs.gcloud_dir }}:/root/.config/gcloud:ro"
+    containerImage: python:3.12-bookworm
+    env:
+      GCP_PROJECT_ID: "{{ kv('GCP_PROJECT_ID') }}"
+      MART_DATASET: "spotify_data_marts"
+      GOOGLE_APPLICATION_CREDENTIALS: "/root/.config/gcloud/application_default_credentials.json"
+    commands:
+      - pip install google-cloud-bigquery pandas db-dtypes matplotlib numpy
+      - python /app/scripts/plot_audio_correlations.py

@@ -1,0 +1,20 @@
+id: 02_spotify_process_gcs
+namespace: company.team
+
+tasks:
+  - id: run_pyspark_gcs
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      volumes:
+        - "{{ envs.project_dir }}/scripts:/app/scripts:ro"
+        - "{{ envs.gcloud_dir }}:/root/.config/gcloud:ro"
+    containerImage: python:3.12-bookworm
+    env:
+      GCP_PROJECT_ID: "{{ kv('GCP_PROJECT_ID') }}"
+      GCS_BUCKET_NAME: "{{ kv('GCS_BUCKET_NAME') }}"
+      BQ_DATASET: "{{ kv('GCP_DATASET') }}"
+    commands:
+      - apt-get update && apt-get install -y default-jre
+      - pip install pyspark==3.5.3 google-cloud-storage google-cloud-bigquery
+      - python /app/scripts/process_data_gcs.py

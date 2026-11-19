@@ -1,0 +1,50 @@
+id: 00_gcp_kv_setup
+namespace: company.team
+
+tasks:
+  # --- GCP / BigQuery Configuration ---
+  - id: set_gcp_project_id
+    type: io.kestra.plugin.core.kv.Set
+    key: GCP_PROJECT_ID
+    value: spotify-data-pipeline-513809
+
+  - id: set_gcs_bucket_name
+    type: io.kestra.plugin.core.kv.Set
+    key: GCS_BUCKET_NAME
+    value: spotify-datalake-spotify-data-pipeline-513809
+
+  - id: set_gcp_dataset
+    type: io.kestra.plugin.core.kv.Set
+    key: GCP_DATASET
+    value: spotify_data_raw
+
+  - id: set_gcp_location
+    type: io.kestra.plugin.core.kv.Set
+    key: GCP_LOCATION
+    value: EU
+
+  # --- Postgres Configuration (Data Destination) ---
+  - id: set_postgres_host
+    type: io.kestra.plugin.core.kv.Set
+    key: POSTGRES_HOST
+    value: host.docker.internal
+
+  - id: set_postgres_port
+    type: io.kestra.plugin.core.kv.Set
+    key: POSTGRES_PORT
+    value: "5432"
+
+  - id: set_postgres_db
+    type: io.kestra.plugin.core.kv.Set
+    key: POSTGRES_DB
+    value: spotify_db
+
+  - id: set_postgres_user
+    type: io.kestra.plugin.core.kv.Set
+    key: POSTGRES_USER
+    value: root
+
+  - id: set_postgres_password
+    type: io.kestra.plugin.core.kv.Set
+    key: POSTGRES_PASSWORD
+    value: root
