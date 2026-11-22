@@ -74,6 +74,7 @@ The architecture supports a **dual-track workflow**—a lightweight **Local Deve
     │   ├── create_dev_dataset.py                                # Referential-integrity subset builder (Popularity >= 30)
     │   ├── ingest_to_gcs.py                                     # Idempotent Kaggle-to-GCS sync script
     │   ├── process_data_local.py                                # Local PySpark Star Schema loader (PostgreSQL)
+    │   ├── process_data_jetson.py                               # Memory-tuned full-catalog loader (PostgreSQL on Edge/Jetson)
     │   ├── process_data_gcs.py                                  # Distributed PySpark Star Schema loader (BigQuery)
     │   └── plot_audio_correlations.py                           # 9x9 2D Log-Density & Histogram matrix generator
     ├── terraform/
@@ -148,8 +149,10 @@ Processing the full 256M-track dataset requires substantial compute and storage.
 
 ### Prerequisites
 * Docker & Docker Compose
-* Terraform (`>= 1.5`)
-* Google Cloud SDK (`gcloud auth application-default login`)
+* Python (`>= 3.10`) & [`uv`](https://docs.astral.sh/uv/) (for local PySpark execution and dependency management)
+* **Java Runtime / JDK (`11` or `17`)** (required by Apache Spark / PySpark JVM; e.g., `sudo apt install -y openjdk-17-jre-headless`)
+* Terraform (`>= 1.5`) *(for Cloud Prod Track)*
+* Google Cloud SDK (`gcloud auth application-default login`) *(for Cloud Prod Track)*
 * Kaggle API credentials (`KAGGLE_API_TOKEN` in `.env`)
 
 ### 1. Provision Cloud Infrastructure
@@ -168,4 +171,10 @@ Access Kestra UI at `http://localhost:8080` (`admin@kestra.io` / `Admin1234!`) a
 ### 3. Run the Pipeline
 1. **Initialize KV Store:** Execute `00_gcp_kv_setup` in Kestra (`company.team` namespace).
 2. **Local Dev Track:** Download the dev dataset subset, run `02_spotify_process_local` to populate PostgreSQL with primary keys and foreign-key indexes.
+3. **Full Local / Edge Track (NVIDIA Jetson Orin Nano - 100% Catalog):**
+   - Start PostgreSQL (`docker compose up -d spotify_db`), mount the full Parquet archive (e.g., `/mnt/hdd_jetson/datasets/spotify-metadata-by-annas-archive`), and run the memory-tuned loader via `uv`:
+     ```bash
+     uv sync
+     nohup uv run python scripts/process_data_jetson.py > ingest.log 2>&1 &
+     ```
 3. **Cloud Production Track:** Execute the master orchestrator **`04_spotify_full_pipeline`** (toggling `run_ingestion` and `run_pyspark_etl` as needed) to populate BigQuery Raw, build all 13 Analytical Marts, and generate `scripts/audio_features_correlation_matrix.png`.
