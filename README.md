@@ -52,6 +52,7 @@ The architecture supports a **dual-track workflow**—a lightweight **Local Deve
 * **Cloud Data Platform:** Google Cloud Storage (Data Lake) & Google BigQuery (Data Warehouse & Analytical Marts, `EU` multi-region).
 * **Local Dev Environment:** PostgreSQL 18, pgAdmin 4, and a referentially intact developer dataset subset published on Kaggle.
 * **Visualization & Analytics:** Looker Studio & Python (`Matplotlib`, `NumPy`, `Pandas`) for 2D log-density correlation matrices.
+- **Local & Edge Data Warehouse:** PostgreSQL 18 with [`pgvector`](https://github.com/pgvector/pgvector) (`pgvector/pgvector:pg18`), pgAdmin 4, hybrid NVMe/HDD `TABLESPACE` partitioning, and a referentially intact developer dataset subset published on Kaggle.
 
 ---
 
@@ -66,6 +67,7 @@ The architecture supports a **dual-track workflow**—a lightweight **Local Deve
     │       ├── main_company.team.01_spotify_ingest.yaml         # Incremental Kaggle-to-GCS ingestion (byte-size validation)
     │       ├── main_company.team.02_spotify_process_local.yaml  # Local Dev PySpark ETL -> PostgreSQL + PKs/Indexes
     │       ├── main_company.team.02_spotify_process_gcs.yaml    # Cloud Prod PySpark ETL -> BigQuery Raw (Full 256M catalog)
+    │       ├── main_company.team.02_spotify_process_jetson.yaml # Edge/Jetson PySpark ETL -> Hybrid NVMe/HDD PostgreSQL
     │       ├── main_company.team.03_spotify_bigquery_marts.yaml # Parallel BigQuery Analytical Marts + 9x9 Heatmap
     │       └── main_company.team.04_spotify_full_pipeline.yaml  # End-to-End Master Orchestrator (Subflow chaining)
     ├── scripts/
@@ -142,6 +144,9 @@ Processing the full 256M-track dataset requires substantial compute and storage.
 4. **BigQuery Partitioning Limits:**
    * *Challenge:* Daily partitioning on historical album release dates (`1900–2026`) exceeded BigQuery's hard ceiling of 4,000 partitions per table.
    * *Solution:* Adopted annual truncation (`DATE_TRUNC(..., YEAR)`) and pre-aggregated analytical marts in `spotify_data_marts`.
+5. **Full-Catalog Edge Deployment on 8 GB Unified-RAM Hardware (NVIDIA Jetson Orin Nano):**
+   - *Challenge:* Ingesting and indexing 326+ GB of core catalog data (excluding 1.7B playlist rows) on an ARM64 edge device with 8 GB shared RAM and a 456 GB NVMe caused Linux OOM kills during wide JDBC writes (`dim_albums`) and risked NVMe exhaustion during B-tree index creation.
+   - *Solution:* Tuned PySpark for low-memory execution (`spark.driver.memory=2048m`, `coalesce(1)`, `batchsize=10000`, `-XX:+UseG1GC`), explicitly stopped the JVM prior to DDL execution, and architected a PostgreSQL `TABLESPACE` split (`pg_default` on NVMe for low-latency track/ISRC/vector lookups; `hdd_space` on an `ext4` external HDD for secondary album, image, and file metadata).
 
 ---
 
@@ -164,17 +169,18 @@ Processing the full 256M-track dataset requires substantial compute and storage.
 ### 2. Start Kestra & Local PostgreSQL Stack
 
     cp .env.example .env  # Add your KAGGLE_API_TOKEN
-    docker-compose up -d
+    docker compose up -d
 
 Access Kestra UI at `http://localhost:8080` (`admin@kestra.io` / `Admin1234!`) and pgAdmin at `http://localhost:8085`.
 
 ### 3. Run the Pipeline
 1. **Initialize KV Store:** Execute `00_gcp_kv_setup` in Kestra (`company.team` namespace).
-2. **Local Dev Track:** Download the dev dataset subset, run `02_spotify_process_local` to populate PostgreSQL with primary keys and foreign-key indexes.
-3. **Full Local / Edge Track (NVIDIA Jetson Orin Nano - 100% Catalog):**
-   - Start PostgreSQL (`docker compose up -d spotify_db`), mount the full Parquet archive (e.g., `/mnt/hdd_jetson/datasets/spotify-metadata-by-annas-archive`), and run the memory-tuned loader via `uv`:
+2. **Local Dev Track:** Download the dev dataset subset and run `02_spotify_process_local` to populate PostgreSQL with primary keys and foreign-key indexes.
+3. **Full Edge Track (NVIDIA Jetson Orin Nano - 100% Core Catalog):**
+   - Start PostgreSQL (`docker compose up -d spotify_db`), mount the full Parquet archive (e.g., `/mnt/hdd_jetson/datasets/spotify-metadata-by-annas-archive`), optionally prepare `/mnt/hdd_jetson/pg_hdd_tablespace` (`chown 999:999`) for hybrid NVMe/HDD storage, and run via Kestra (`02_spotify_process_jetson`) or CLI:
      ```bash
      uv sync
-     nohup uv run python scripts/process_data_jetson.py > ingest.log 2>&1 &
+     nohup uv run python scripts/process_data_jetson.py > ingest_jetson.log 2>&1 &
      ```
-3. **Cloud Production Track:** Execute the master orchestrator **`04_spotify_full_pipeline`** (toggling `run_ingestion` and `run_pyspark_etl` as needed) to populate BigQuery Raw, build all 13 Analytical Marts, and generate `scripts/audio_features_correlation_matrix.png`.
+   - *(Pass `--include-playlists` only if sufficient NVMe/HDD storage is available for the 1.7B playlist-track rows).*
+4. **Cloud Production Track:** Execute the master orchestrator **`04_spotify_full_pipeline`** (toggling `run_ingestion` and `run_pyspark_etl` as needed) to populate BigQuery Raw, build all 13 Analytical Marts, and generate `assets/audio_features_correlation_matrix.png`.
