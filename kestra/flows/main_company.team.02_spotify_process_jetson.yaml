@@ -1,0 +1,33 @@
+id: 02_spotify_process_jetson
+namespace: company.team
+description: Memory-tuned PySpark ingestion from HDD Parquet files into hybrid NVMe/HDD PostgreSQL on NVIDIA Jetson Orin Nano.
+
+inputs:
+  - id: include_playlists
+    type: BOOLEAN
+    defaults: false
+    description: Enable to ingest playlist tables (~1.7B rows). Keep false to preserve NVMe storage.
+
+tasks:
+  - id: run_pyspark_jetson
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      volumes:
+        - "{{ envs.project_dir }}/scripts:/app/scripts:ro"
+        - "/mnt/hdd_jetson:/mnt/hdd_jetson"
+    containerImage: python:3.12-bookworm
+    env:
+      LOCAL_DATA_PATH: "/mnt/hdd_jetson/datasets/spotify-metadata-by-annas-archive"
+      SPARK_TEMP_DIR: "/mnt/hdd_jetson/spark-temp"
+      HDD_TABLESPACE_DIR: "/mnt/hdd_jetson/pg_hdd_tablespace"
+      INCLUDE_PLAYLISTS: "{{ inputs.include_playlists }}"
+      POSTGRES_HOST: "{{ kv('POSTGRES_HOST') }}"
+      POSTGRES_PORT: "{{ kv('POSTGRES_PORT') }}"
+      POSTGRES_DB: "{{ kv('POSTGRES_DB') }}"
+      POSTGRES_USER: "{{ kv('POSTGRES_USER') }}"
+      POSTGRES_PASSWORD: "{{ kv('POSTGRES_PASSWORD') }}"
+    commands:
+      - apt-get update && apt-get install -y default-jre
+      - pip install pyspark==3.5.3 "psycopg[binary]"
+      - python /app/scripts/process_data_jetson.py {{ inputs.include_playlists ? '--include-playlists' : '' }}

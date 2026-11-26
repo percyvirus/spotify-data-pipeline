@@ -10,8 +10,9 @@ volumes:
   
 services:
   spotify_db:
-    image: postgres:18
+    image: pgvector/pgvector:pg18
     container_name: spotify_db
+    restart: unless-stopped
     environment:
       POSTGRES_USER: root
       POSTGRES_PASSWORD: root
@@ -20,6 +21,14 @@ services:
       - "5432:5432"
     volumes:
       - spotify_postgres_data:/var/lib/postgresql
+      - /mnt/hdd_jetson/pg_hdd_tablespace:/mnt/hdd_jetson/pg_hdd_tablespace
+    shm_size: '1gb'
+    command: >
+      postgres
+      -c shared_buffers=2GB
+      -c work_mem=64MB
+      -c maintenance_work_mem=512MB
+      -c effective_cache_size=4GB
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -d spotify_db -U root"]
       interval: 30s

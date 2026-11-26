@@ -5,5 +5,5 @@
 scripts/gcp-creds.json
 scripts/*.png
 __pycache__/
-.DS_Storeingest.log
-ingest.log
+.DS_Store
+*.log

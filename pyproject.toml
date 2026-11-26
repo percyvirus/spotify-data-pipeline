@@ -12,6 +12,7 @@ dependencies = [
     "matplotlib>=3.9.0",
     "numpy>=1.26.4",
     "pandas>=2.2.2",
+    "psycopg[binary]>=3.3.9",
     "pyarrow>=17.0.0",
     "pyspark==3.5.3",
     "six>=1.16.0",

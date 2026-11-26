@@ -1,30 +1,38 @@
+import argparse
 import os
 import time
+import psycopg
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, concat_ws, lit, md5, substring, when
 
 # --- Configuration ---
 LOCAL_DATA_PATH = os.getenv("LOCAL_DATA_PATH", "/mnt/hdd_jetson/datasets/spotify-metadata-by-annas-archive")
+SPARK_TEMP_DIR = os.getenv("SPARK_TEMP_DIR", "/mnt/hdd_jetson/spark-temp")
+HDD_TABLESPACE_DIR = os.getenv("HDD_TABLESPACE_DIR", "/mnt/hdd_jetson/pg_hdd_tablespace")
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
 POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
 POSTGRES_DB = os.getenv("POSTGRES_DB", "spotify_db")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "root")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "root")
 
-POSTGRES_URL = f"jdbc:postgresql://{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}?rewriteBatchedInserts=true"
+POSTGRES_JDBC_URL = f"jdbc:postgresql://{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}?rewriteBatchedInserts=true"
+POSTGRES_DSN = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+
 POSTGRES_PROPERTIES = {
     "user": POSTGRES_USER,
     "password": POSTGRES_PASSWORD,
     "driver": "org.postgresql.Driver",
-    "batchsize": "50000",
-    "isolationLevel": "NONE"
+    "batchsize": "10000",
+    "isolationLevel": "NONE",
+    "truncate": "true"
 }
+
 
 def write_to_postgres(df, table_name):
     start_time = time.time()
     print(f"[{time.strftime('%H:%M:%S')}] Writing {table_name} to PostgreSQL...", flush=True)
-    df.coalesce(2).write.jdbc(
-        url=POSTGRES_URL,
+    df.coalesce(1).write.jdbc(
+        url=POSTGRES_JDBC_URL,
         table=table_name,
         mode="overwrite",
         properties=POSTGRES_PROPERTIES
@@ -32,27 +40,144 @@ def write_to_postgres(df, table_name):
     elapsed_time = time.time() - start_time
     print(f"[{time.strftime('%H:%M:%S')}] Finished {table_name} in {elapsed_time / 60:.2f} min.", flush=True)
 
+
 def generate_uuid_from_rowid(column_name):
     hash_col = md5(col(column_name).cast("string"))
-    uuid_str = concat_ws("-", 
-        substring(hash_col, 1, 8), substring(hash_col, 9, 4),
-        substring(hash_col, 13, 4), substring(hash_col, 17, 4), substring(hash_col, 21, 12)
+    uuid_str = concat_ws(
+        "-",
+        substring(hash_col, 1, 8),
+        substring(hash_col, 9, 4),
+        substring(hash_col, 13, 4),
+        substring(hash_col, 17, 4),
+        substring(hash_col, 21, 12)
     )
     return when(col(column_name).isNotNull(), uuid_str).otherwise(lit(None))
 
+
+def optimize_postgres_storage_and_indexes(include_playlists: bool):
+    """Configure pgvector, move secondary tables to HDD tablespace, and build indexes."""
+    print(f"[{time.strftime('%H:%M:%S')}] Applying PostgreSQL tablespace routing and indexes...", flush=True)
+
+    with psycopg.connect(POSTGRES_DSN, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            # 1. Enable pgvector extension
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+
+            # 2. Check or create hdd_space tablespace if directory exists
+            cur.execute("SELECT 1 FROM pg_tablespace WHERE spcname = 'hdd_space';")
+            has_hdd_space = cur.fetchone() is not None
+
+            if not has_hdd_space and os.path.isdir(HDD_TABLESPACE_DIR):
+                try:
+                    cur.execute(f"CREATE TABLESPACE hdd_space LOCATION '{HDD_TABLESPACE_DIR}';")
+                    has_hdd_space = True
+                    print("[INFO] Created PostgreSQL tablespace 'hdd_space'.", flush=True)
+                except Exception as exc:
+                    print(f"[WARN] Could not create 'hdd_space' tablespace ({exc}). Using default NVMe storage.", flush=True)
+
+            # 3. Move heavy secondary tables to HDD to preserve NVMe capacity
+            if has_hdd_space:
+                hdd_tables = [
+                    "fact_track_files",
+                    "sat_album_images",
+                    "dim_albums",
+                    "bridge_artist_albums",
+                    "sat_artist_images",
+                    "bridge_artist_genres",
+                    "dim_artist_redirects"
+                ]
+                for table in hdd_tables:
+                    print(f"[{time.strftime('%H:%M:%S')}] Moving {table} to hdd_space...", flush=True)
+                    cur.execute(f"ALTER TABLE {table} SET TABLESPACE hdd_space;")
+
+            # 4. Primary keys and low-latency indexes on NVMe (pg_default)
+            nvme_ddl = [
+                "ALTER TABLE dim_artists ADD PRIMARY KEY (id);",
+                "ALTER TABLE dim_tracks ADD PRIMARY KEY (id);",
+                "ALTER TABLE dim_markets ADD PRIMARY KEY (id);",
+                "ALTER TABLE fact_track_audio_features ADD PRIMARY KEY (id);",
+                "CREATE INDEX IF NOT EXISTS idx_dim_tracks_spotify_id ON dim_tracks(spotify_id);",
+                "CREATE INDEX IF NOT EXISTS idx_dim_tracks_isrc ON dim_tracks(spotify_isrc);",
+                "CREATE INDEX IF NOT EXISTS idx_fact_audio_track ON fact_track_audio_features(track_id);",
+                "CREATE INDEX IF NOT EXISTS idx_bridge_track_artists_track ON bridge_track_artists(track_id);",
+                "CREATE INDEX IF NOT EXISTS idx_bridge_track_artists_artist ON bridge_track_artists(artist_id);"
+            ]
+            for stmt in nvme_ddl:
+                print(f"[{time.strftime('%H:%M:%S')}] Executing: {stmt}", flush=True)
+                cur.execute(stmt)
+
+            # 5. Primary keys and heavy indexes routed to HDD (if available)
+            ts_clause_pk = "USING INDEX TABLESPACE hdd_space" if has_hdd_space else ""
+            ts_clause_idx = "TABLESPACE hdd_space" if has_hdd_space else ""
+
+            hdd_ddl = [
+                f"ALTER TABLE fact_track_files ADD PRIMARY KEY (id) {ts_clause_pk};",
+                f"ALTER TABLE dim_albums ADD PRIMARY KEY (id) {ts_clause_pk};",
+                f"CREATE INDEX IF NOT EXISTS idx_fact_files_track ON fact_track_files(track_id) {ts_clause_idx};",
+                f"CREATE INDEX IF NOT EXISTS idx_dim_tracks_album ON dim_tracks(album_id) {ts_clause_idx};",
+                f"CREATE INDEX IF NOT EXISTS idx_dim_albums_market ON dim_albums(spotify_available_markets_id) {ts_clause_idx};",
+                f"CREATE INDEX IF NOT EXISTS idx_bridge_artist_albums_artist ON bridge_artist_albums(artist_id) {ts_clause_idx};",
+                f"CREATE INDEX IF NOT EXISTS idx_bridge_artist_albums_album ON bridge_artist_albums(album_id) {ts_clause_idx};",
+                f"CREATE INDEX IF NOT EXISTS idx_bridge_artist_genres_artist ON bridge_artist_genres(artist_id) {ts_clause_idx};"
+            ]
+            for stmt in hdd_ddl:
+                print(f"[{time.strftime('%H:%M:%S')}] Executing: {stmt}", flush=True)
+                cur.execute(stmt)
+
+            # 6. Optional playlist indexes
+            if include_playlists:
+                playlist_ddl = [
+                    f"ALTER TABLE dim_playlists ADD PRIMARY KEY (id) {ts_clause_pk};",
+                    f"CREATE INDEX IF NOT EXISTS idx_fact_playlist_tracks_playlist ON fact_playlist_tracks(playlist_id) {ts_clause_idx};",
+                    f"CREATE INDEX IF NOT EXISTS idx_fact_playlist_tracks_track ON fact_playlist_tracks(track_id) {ts_clause_idx};"
+                ]
+                for stmt in playlist_ddl:
+                    print(f"[{time.strftime('%H:%M:%S')}] Executing: {stmt}", flush=True)
+                    cur.execute(stmt)
+
+            print(f"[{time.strftime('%H:%M:%S')}] Running ANALYZE...", flush=True)
+            cur.execute("ANALYZE;")
+
+    print(f"[{time.strftime('%H:%M:%S')}] PostgreSQL storage routing and indexing complete.", flush=True)
+
+
+def parse_args():
+    env_default = os.getenv("INCLUDE_PLAYLISTS", "false").strip().lower() in ("1", "true", "yes")
+    parser = argparse.ArgumentParser(description="Memory-Tuned Spotify Catalog ETL for NVIDIA Jetson Orin Nano")
+    parser.add_argument(
+        "--include-playlists",
+        action="store_true",
+        default=env_default,
+        help="Include playlist tables (dim_playlists, sat_playlist_images, fact_playlist_tracks - ~1.7B rows)"
+    )
+    parser.add_argument(
+        "--skip-post-sql",
+        action="store_true",
+        default=False,
+        help="Skip tablespace routing and index creation after Spark ingestion"
+    )
+    return parser.parse_args()
+
+
 def main():
-    os.makedirs("/tmp/spark-temp", exist_ok=True)
-    print("Initializing Memory-Tuned Spark Session for Jetson Orin Nano (8GB)...", flush=True)
-    
+    args = parse_args()
+    os.makedirs(SPARK_TEMP_DIR, exist_ok=True)
+    print(
+        f"Initializing Memory-Tuned Spark Session for Jetson Orin Nano (include_playlists={args.include_playlists})...",
+        flush=True
+    )
+
     spark = SparkSession.builder \
         .appName("SpotifyJetsonFullIngest") \
         .master("local[2]") \
         .config("spark.jars.packages", "org.postgresql:postgresql:42.7.2") \
-        .config("spark.driver.memory", "4g") \
-        .config("spark.memory.fraction", "0.6") \
+        .config("spark.driver.memory", "2048m") \
+        .config("spark.driver.memoryOverhead", "512m") \
+        .config("spark.driver.extraJavaOptions", "-XX:+UseG1GC") \
+        .config("spark.memory.fraction", "0.5") \
         .config("spark.sql.shuffle.partitions", "512") \
-        .config("spark.sql.files.maxPartitionBytes", "67108864") \
-        .config("spark.local.dir", "/tmp/spark-temp") \
+        .config("spark.sql.files.maxPartitionBytes", "33554432") \
+        .config("spark.local.dir", SPARK_TEMP_DIR) \
         .getOrCreate()
 
     spark.sparkContext.setLogLevel("WARN")
@@ -63,7 +188,7 @@ def main():
     files_parquet = os.path.join(LOCAL_DATA_PATH, "spotify_clean_track_files_parquet")
     redirects_json = os.path.join(LOCAL_DATA_PATH, "spotify_artist_redirects.json")
 
-    # 1. Dimensions
+    # 1. Core Dimensions
     df_redirects = spark.read.json(redirects_json)
     dim_artist_redirects = df_redirects.filter(col("from_id").isNotNull() & col("to_id").isNotNull()) \
         .select(col("from_id").alias("spotify_from_id"), col("to_id").alias("spotify_to_id"))
@@ -124,24 +249,6 @@ def main():
         col("explicit").cast("boolean").alias("spotify_explicit")
     )
     write_to_postgres(dim_tracks, "dim_tracks")
-
-    df_playlists = spark.read.parquet(os.path.join(playlists_parquet, "playlists.parquet"))
-    dim_playlists = df_playlists.select(
-        generate_uuid_from_rowid("rowid").alias("id"),
-        col("id").alias("spotify_id"),
-        col("snapshot_id").alias("spotify_snapshot_id"),
-        col("fetched_at").cast("long").alias("spotify_fetched_at"),
-        col("name").alias("spotify_name"),
-        col("description").alias("spotify_description"),
-        col("collaborative").cast("boolean").alias("spotify_collaborative"),
-        col("public").cast("boolean").alias("spotify_public"),
-        col("primary_color").alias("spotify_primary_color"),
-        col("owner_id").alias("spotify_owner_id"),
-        col("owner_display_name").alias("spotify_owner_display_name"),
-        col("followers_total").cast("long").alias("spotify_followers_total"),
-        col("tracks_total").cast("long").alias("spotify_tracks_total")
-    )
-    write_to_postgres(dim_playlists, "dim_playlists")
 
     # 2. Facts requiring join with tracks
     tracks_lookup = df_tracks.select(col("id"), col("rowid").alias("track_rowid"))
@@ -206,7 +313,10 @@ def main():
     # 3. Bridges & Satellites
     df_track_artists = spark.read.parquet(os.path.join(base_parquet, "track_artists.parquet"))
     write_to_postgres(
-        df_track_artists.select(generate_uuid_from_rowid("track_rowid").alias("track_id"), generate_uuid_from_rowid("artist_rowid").alias("artist_id")),
+        df_track_artists.select(
+            generate_uuid_from_rowid("track_rowid").alias("track_id"),
+            generate_uuid_from_rowid("artist_rowid").alias("artist_id")
+        ),
         "bridge_track_artists"
     )
 
@@ -224,51 +334,6 @@ def main():
 
     df_artist_genres = spark.read.parquet(os.path.join(base_parquet, "artist_genres.parquet"))
     write_to_postgres(
-        df_artist_genres.select(generate_uuid_from_rowid("artist_rowid").alias("artist_id"), col("genre").alias("spotify_genre")),
-        "bridge_artist_genres"
-    )
-
-    df_artist_images = spark.read.parquet(os.path.join(base_parquet, "artist_images.parquet"))
-    write_to_postgres(
-        df_artist_images.select(generate_uuid_from_rowid("artist_rowid").alias("artist_id"), col("width").cast("integer").alias("spotify_width"), col("height").cast("integer").alias("spotify_height"), col("url").alias("spotify_url")),
-        "sat_artist_images"
-    )
-
-    df_album_images = spark.read.parquet(os.path.join(base_parquet, "album_images.parquet"))
-    write_to_postgres(
-        df_album_images.select(generate_uuid_from_rowid("album_rowid").alias("album_id"), col("width").cast("integer").alias("spotify_width"), col("height").cast("integer").alias("spotify_height"), col("url").alias("spotify_url")),
-        "sat_album_images"
-    )
-
-    df_playlist_images = spark.read.parquet(os.path.join(playlists_parquet, "playlist_images.parquet"))
-    write_to_postgres(
-        df_playlist_images.select(generate_uuid_from_rowid("playlist_rowid").alias("playlist_id"), col("width").cast("integer").alias("spotify_width"), col("height").cast("integer").alias("spotify_height"), col("url").alias("spotify_url")),
-        "sat_playlist_images"
-    )
-
-    # 4. Largest table last: 1.7B rows
-    df_playlist_tracks = spark.read.parquet(os.path.join(playlists_parquet, "playlist_tracks.parquet"))
-    fact_playlist_tracks = df_playlist_tracks.select(
-        generate_uuid_from_rowid("playlist_rowid").alias("playlist_id"),
-        col("position").cast("integer").alias("spotify_position"),
-        col("is_episode").cast("boolean").alias("spotify_is_episode"),
-        generate_uuid_from_rowid("track_rowid").alias("track_id"),
-        col("id_if_not_in_tracks_table").alias("spotify_id_if_not_in_tracks_table"),
-        col("added_at").cast("long").alias("spotify_added_at"),
-        col("added_by_id").alias("spotify_added_by_id"),
-        col("primary_color").alias("spotify_primary_color"),
-        col("video_thumbnail_url").alias("spotify_video_thumbnail_url"),
-        col("is_local").cast("boolean").alias("spotify_is_local"),
-        col("name_if_is_local").alias("spotify_name_if_is_local"),
-        col("uri_if_is_local").alias("spotify_uri_if_is_local"),
-        col("album_name_if_is_local").alias("spotify_album_name_if_is_local"),
-        col("artists_name_if_is_local").alias("spotify_artists_name_if_is_local"),
-        col("duration_ms_if_is_local").cast("long").alias("spotify_duration_ms_if_is_local")
-    )
-    write_to_postgres(fact_playlist_tracks, "fact_playlist_tracks")
-
-    print("Full Jetson pipeline execution complete.", flush=True)
-    spark.stop()
-
-if __name__ == "__main__":
-    main()
+        df_artist_genres.select(
+            generate_uuid_from_rowid("artist_rowid").alias("artist_id"),
+            col("genre").alias("spotify
