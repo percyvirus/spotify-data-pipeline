@@ -1,0 +1,37 @@
+id: 05_musicbrainz_staging
+namespace: company.team
+description: Download latest MetaBrainz fullexport dumps and load relational staging tables into PostgreSQL.
+
+inputs:
+  - id: dump_tag
+    type: STRING
+    defaults: ""
+    description: Optional MetaBrainz fullexport folder tag (e.g. 20261125-001614). Leave empty for LATEST.
+
+  - id: skip_download
+    type: BOOLEAN
+    defaults: false
+    description: Set to true if mbdump.tar.bz2 and mbdump-derived.tar.bz2 are already downloaded locally.
+
+tasks:
+  - id: load_musicbrainz_staging
+    type: io.kestra.plugin.scripts.python.Commands
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      volumes:
+        - "{{ envs.project_dir }}/scripts:/app/scripts:ro"
+        - "{{ envs.project_dir }}/data/musicbrainz_dumps:/app/data/musicbrainz_dumps"
+    containerImage: python:3.12-bookworm
+    env:
+      MB_DOWNLOAD_DIR: "/app/data/musicbrainz_dumps"
+      MB_POSTGRES_HOST: "{{ kv('MB_POSTGRES_HOST', errorOnMissing=false) ?? 'host.docker.internal' }}"
+      MB_POSTGRES_PORT: "{{ kv('MB_POSTGRES_PORT', errorOnMissing=false) ?? '5433' }}"
+      MB_POSTGRES_DB: "{{ kv('MB_POSTGRES_DB', errorOnMissing=false) ?? 'musicbrainz_db' }}"
+      MB_POSTGRES_USER: "{{ kv('MB_POSTGRES_USER', errorOnMissing=false) ?? 'musicbrainz' }}"
+      MB_POSTGRES_PASSWORD: "{{ kv('MB_POSTGRES_PASSWORD', errorOnMissing=false) ?? 'musicbrainz' }}"
+    commands:
+      - pip install "psycopg[binary]"
+      - >
+        python /app/scripts/ingest_musicbrainz_staging.py
+        {{ inputs.dump_tag != '' ? '--dump-tag ' + inputs.dump_tag : '' }}
+        {{ inputs.skip_download ? '--skip-download' : '' }}
